@@ -5,6 +5,8 @@ FROM rust:latest
 RUN apt-get update && apt-get install -y \
     # 開発ツール
     git tree \
+    # pdfpcの依存関係
+    pdf-presenter-console xauth \
     # aptキャッシュのクリーンアップ
     && rm -rf /var/lib/apt/lists/*
 
