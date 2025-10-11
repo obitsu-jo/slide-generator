@@ -1,0 +1,23 @@
+{
+  "name": "Rust PDF Slide Generator",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  // VS Code固有の設定
+  "customizations": {
+    "vscode": {
+      // 推奨するVS Code拡張機能
+      "extensions": [
+        "rust-lang.rust-analyzer", // Rustの言語サポート (必須級)
+        "tamasfe.even-better-toml", // Cargo.tomlの編集を補助
+        "serayuzgur.crates" // Cargo.tomlの依存関係バージョンを管理
+      ]
+    }
+  },
+  // コンテナ起動後に実行するコマンド
+  "postCreateCommand": "git config --global --add safe.directory /workspaces/jobitsu/slide-generator",
+
+  // コンテナに接続するユーザーを指定
+  "remoteUser": "root"
+}
