@@ -1,23 +1,41 @@
 use anyhow::Result;
 use printpdf::*;
 use std::collections::HashMap;
-use std::fmt::format;
 use std::fs;
 
+// --- 型定義 (変更なし) ---
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum FontStyle {
-    Regular,
-    Bold,
-    RegularIt,
-    BoldIt,
+enum FontStyle { Regular, Bold }
+
+#[derive(Debug, Clone, Copy)]
+enum NamedColor { Black, White, Red, Green, Blue }
+
+#[derive(Debug, Clone, Copy)]
+enum SlideColor {
+    Named(NamedColor),
+    Custom(f32, f32, f32), // f32からf32に変更し、精度を統一
 }
 
-// DrawConfigの構造を変更。ページの物理的な高さ(Pt)を保持する
+impl SlideColor {
+    fn into_pdf_color(self) -> Color {
+        match self {
+            SlideColor::Named(named) => match named {
+                NamedColor::Black => Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)),
+                NamedColor::White => Color::Rgb(Rgb::new(1.0, 1.0, 1.0, None)),
+                NamedColor::Red   => Color::Rgb(Rgb::new(0.8, 0.0, 0.0, None)),
+                NamedColor::Green => Color::Rgb(Rgb::new(0.0, 0.8, 0.0, None)),
+                NamedColor::Blue  => Color::Rgb(Rgb::new(0.0, 0.0, 0.8, None)),
+            },
+            SlideColor::Custom(r, g, b) => Color::Rgb(Rgb::new(r, g, b, None)),
+        }
+    }
+}
+
 struct DrawConfig {
     page_height_pt: Pt,
     base_font_size: Pt,
     default_font_style: FontStyle,
-    default_color: Color,
+    default_color: SlideColor,
 }
 
 fn load_font(doc: &mut PdfDocument, path: &str, warns: &mut Vec<PdfWarnMsg>) -> FontId {
@@ -26,77 +44,145 @@ fn load_font(doc: &mut PdfDocument, path: &str, warns: &mut Vec<PdfWarnMsg>) -> 
     doc.add_font(&parsed)
 }
 
-/// グリッド座標系に基づいてページにテキストを追加する関数
-///
-/// # Arguments
-/// * `x`, `y` - グリッドの座標 (列, 行)。ページの左上が (0, 0)。
-/// * `size_ratio` - 基準フォントサイズからの倍率。1.0でグリッド1マス分の大きさ。
-fn add_text(
+// --- === 新しいアーキテクチャの導入 === ---
+
+// 1. 中間表現: スタイル付きのテキスト断片
+#[derive(Clone)]
+struct TextSpan {
+    text: String,
+    style: FontStyle,
+    size_ratio: f32,
+    color: SlideColor,
+}
+
+// 2. 中間表現: テキスト断片か、改行のような制御命令かを表す
+#[derive(Clone)]
+enum Content {
+    Span(TextSpan),
+    Newline,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum VAlign {
+    Top,
+    Middle,
+    Bottom, // ベースライン揃え
+}
+
+/// 【低レベル関数】単一のTextSpanを、指定された絶対グリッド座標に描画する
+fn add_single_span(
     ops: &mut Vec<Op>,
     fonts: &HashMap<FontStyle, FontId>,
     config: &DrawConfig,
-    text: &str,
-    x: f32, // 単位: 文字数 (列)
-    y: f32, // 単位: 文字数 (行)
-    style: Option<FontStyle>,
-    size_ratio: Option<f32>,
-    color: Option<Color>,
+    span: &TextSpan,
+    col: f32,
+    row: f32,
 ) {
-    let final_style = style.unwrap_or(config.default_font_style);
-    let final_size_ratio = size_ratio.unwrap_or(1.0);
-    let final_color = color.unwrap_or_else(|| config.default_color.clone());
-
-    let font_id = fonts.get(&final_style).expect("Specified font style not loaded.");
-    // 最終的なフォントサイズを計算
-    let final_font_size = config.base_font_size * final_size_ratio;
+    let final_pdf_color = span.color.into_pdf_color();
+    let font_id = fonts.get(&span.style).expect("Specified font style not loaded.");
+    let final_font_size = config.base_font_size * span.size_ratio;
     
-    // --- 【重要】グリッド座標から物理座標(Pt)への変換 ---
-    // 1文字の幅/高さ = base_font_size とする
     let base_unit_pt = config.base_font_size.0;
+    let x_pt = Pt(col * base_unit_pt);
+    let y_pt_from_top = Pt(row * base_unit_pt);
 
-    // グリッド座標 (x, y) を物理的なPt座標 (x_pt, y_pt) に変換
-    let x_pt: Pt = Pt(x * base_unit_pt);
-    let y_pt_from_top: Pt = Pt(y * base_unit_pt);
-
-    // PDFの左下原点座標系に変換し、さらにベースラインを調整
     let y_from_bottom_pt = config.page_height_pt - y_pt_from_top;
-    let baseline_y: Pt = y_from_bottom_pt - final_font_size;
+    let baseline_y = y_from_bottom_pt - final_font_size;
     
     let new_ops = vec![
         Op::StartTextSection,
-        Op::SetFillColor { col: (final_color) },
+        Op::SetFillColor { col: (final_pdf_color) },
         Op::SetTextCursor { pos: Point { x: x_pt.into(), y: baseline_y.into() } },
         Op::SetFontSize { size: final_font_size, font: font_id.clone() },
-        Op::WriteText {
-            items: vec![TextItem::Text(text.to_string())],
-            font: font_id.clone(),
-        },
+        Op::WriteText { items: vec![TextItem::Text(span.text.clone())], font: font_id.clone() },
         Op::EndTextSection,
     ];
     ops.extend(new_ops);
 }
 
+/// 【高レベル関数】Contentのリストを受け取り、ブロックとしてレイアウトして描画する
+fn draw_text_block(
+    ops: &mut Vec<Op>,
+    fonts: &HashMap<FontStyle, FontId>,
+    config: &DrawConfig,
+    contents: &[Content],
+    start_col: f32,
+    start_row: f32,
+    line_spacing_ratio: f32,
+    align: VAlign,
+) {
+    let mut current_row = start_row;
+    let mut current_content_index = 0;
+
+    // contentsがなくなるまで、一行ずつループ処理
+    while current_content_index < contents.len() {
+        // --- 1. 測定パス ---
+        // 現在の行に含まれるSpanを収集し、最大のフォントサイズ比率を見つける
+        let mut spans_in_line: Vec<&TextSpan> = Vec::new();
+        let mut line_end_index = current_content_index;
+        let mut max_font_size_ratio = 1.0;
+
+        for i in current_content_index..contents.len() {
+            match &contents[i] {
+                Content::Span(span) => {
+                    spans_in_line.push(span);
+                    if span.size_ratio > max_font_size_ratio {
+                        max_font_size_ratio = span.size_ratio;
+                    }
+                    line_end_index = i + 1;
+                },
+                Content::Newline => {
+                    line_end_index = i + 1;
+                    break; // 改行が見つかったらこの行はここまで
+                },
+            }
+        }
+        
+        // --- 2. 描画パス ---
+        // 収集したSpanを、配置モードに基づいて描画していく
+        let mut current_col = start_col;
+        for span in spans_in_line {
+            // 配置モードに応じて、Y座標のオフセットを計算
+            let y_offset = match align {
+                // Top揃え: オフセットなし。spanの上端は行の上端に揃う。
+                VAlign::Top => 0.0,
+                // Middle揃え: 行の高さの中心と、spanの高さの中心を合わせる
+                VAlign::Middle => (max_font_size_ratio - span.size_ratio) / 2.0,
+                // Bottom(ベースライン)揃え: spanの上端を下にずらし、ベースラインを合わせる
+                VAlign::Bottom => max_font_size_ratio - span.size_ratio,
+            };
+            
+            // 調整後の行座標(row)で低レベル描画関数を呼び出す
+            add_single_span(ops, fonts, config, span, current_col, current_row + y_offset);
+            
+            // 仮想カーソルを右に進める
+            current_col += span.text.chars().count() as f32 * span.size_ratio;
+        }
+
+        // --- 仮想カーソルの更新 ---
+        // 次の行の開始位置に移動
+        current_row += max_font_size_ratio * line_spacing_ratio;
+        // 処理済みのコンテンツをスキップ
+        current_content_index = line_end_index;
+    }
+}
+
+
 fn main() -> Result<()> {
-    // --- グリッドシステムと基本単位の設定 ---
-    // 1. すべての基準となるフォントサイズを定義 (これが1グリッドの大きさになる)
+    // --- グリッドシステムと基本単位の設定  ---
     let base_font_size_pt = Pt(24.0);
-
-    // 2. ページの大きさを「文字数」で定義
-    let grid_width = 32.0;  // 横に32文字分
-    let grid_height = 18.0; // 縦に18文字分
-
-    // 3. 上記設定から、ページの物理的な大きさ(Pt)を計算
+    let grid_width = 32.0;
+    let grid_height = 18.0;
     let page_width_pt = Pt(grid_width * base_font_size_pt.0);
     let page_height_pt = Pt(grid_height * base_font_size_pt.0);
 
-    // --- 描画設定を初期化 ---
     let config = DrawConfig {
-        page_height_pt, // 計算済みの物理的な高さを渡す
+        page_height_pt,
         base_font_size: base_font_size_pt,
         default_font_style: FontStyle::Regular,
-        default_color: Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)),
+        default_color: SlideColor::Named(NamedColor::Black),
     };
-    
+
     // --- ドキュメントとフォントの準備 ---
     let mut doc: PdfDocument = PdfDocument::new("Grid-based Slide");
     let mut font_warnings: Vec<PdfWarnMsg> = Vec::new();
@@ -105,44 +191,60 @@ fn main() -> Result<()> {
     fonts.insert(FontStyle::Regular, load_font(&mut doc, "fonts/RictyDiminished-Regular.ttf", &mut font_warnings));
     fonts.insert(FontStyle::Bold, load_font(&mut doc, "fonts/RictyDiminished-Bold.ttf", &mut font_warnings));
 
-    // --- 描画処理 (グリッド座標で指定) ---
-    let mut page_ops: Vec<Op> = Vec::new();
+    // --- 描画処理 ---
+    let mut all_pages_ops: Vec<Vec<Op>> = Vec::new();
 
-    for count in 0..(grid_height as u8)-2 {
-        add_text(
-            &mut page_ops, &fonts, &config,
-            &format!("{}行目のテキスト", (count + 1) as u8),
-            0.0, 1.0 * count as f32,
-            None, None, None,
-        );
-    }
-    add_text(
-        &mut page_ops, &fonts, &config,
-        &("あ".repeat(31) + "い"),
-        0.0, 16.0,
-        None, None, None,
-    );
-    add_text(
-        &mut page_ops, &fonts, &config,
-        &("a".repeat(63) + "i"),
-        0.0, 17.0,
-        None, None, None,
-    );
+    // --- 1ページ目の作成と描画 ---
+    all_pages_ops.push(Vec::new()); // 新しいページ (インデックス 0) を追加
+    let current_page_index = 0;
 
-    // --- PDFの生成と保存 ---
-    // 計算済みの物理的な大きさでページを生成
+    let page1_title = vec![
+        Content::Span(TextSpan { text: "スライド 1".to_string(), style: FontStyle::Bold, size_ratio: 2.0, color: SlideColor::Named(NamedColor::Black) }),
+    ];
+    draw_text_block(&mut all_pages_ops[current_page_index], &fonts, &config, &page1_title, 2.0, 2.0, 1.2, VAlign::Bottom);
+    
+    let page1_body = vec![
+        Content::Span(TextSpan { text: "これは最初のページです。".to_string(), style: FontStyle::Regular, size_ratio: 1.0, color: SlideColor::Named(NamedColor::Black) }),
+        Content::Newline,
+        Content::Span(TextSpan { text: "複数ページのPDFを作成できます。".to_string(), style: FontStyle::Regular, size_ratio: 1.0, color: SlideColor::Named(NamedColor::Black) }),
+    ];
+    draw_text_block(&mut all_pages_ops[current_page_index], &fonts, &config, &page1_body, 2.0, 5.0, 1.5, VAlign::Top);
+
+    // --- 2ページ目の作成と描画 ---
+    all_pages_ops.push(Vec::new());
+    let current_page_index = 1;
+
+    let page2_title = vec![
+        Content::Span(TextSpan { text: "スライド 2".to_string(), style: FontStyle::Bold, size_ratio: 2.0, color: SlideColor::Named(NamedColor::Black) }),
+    ];
+    draw_text_block(&mut all_pages_ops[current_page_index], &fonts, &config, &page2_title, 2.0, 2.0, 1.2, VAlign::Bottom);
+
+    let page2_body = vec![
+        Content::Span(TextSpan { text: "これは2ページ目です。".to_string(), style: FontStyle::Regular, size_ratio: 1.0, color: SlideColor::Named(NamedColor::Black) }),
+        Content::Newline,
+        Content::Span(TextSpan { text: "複数ページのPDFを作成できます。".to_string(), style: FontStyle::Regular, size_ratio: 1.0, color: SlideColor::Named(NamedColor::Black) }),
+    ];
+    draw_text_block(&mut all_pages_ops[current_page_index], &fonts, &config, &page2_body, 2.0, 5.0, 1.5, VAlign::Top);
+
+
+    // --- PDFの生成と保存 (変更なし) ---
     let page_width_mm: Mm = page_width_pt.into();
     let page_height_mm: Mm = page_height_pt.into();
-    let page: PdfPage = PdfPage::new(page_width_mm, page_height_mm, page_ops);
 
+    // 描画命令のリストをループ処理し、PdfPageのリストを作成
+    let pdf_pages: Vec<PdfPage> = all_pages_ops.into_iter().map(|ops| {
+        PdfPage::new(page_width_mm, page_height_mm, ops)
+    }).collect();
+
+    // 作成したページのリストをドキュメントに追加して保存
     let save_opts: PdfSaveOptions = PdfSaveOptions { subset_fonts: true, ..Default::default() };
     let mut save_warnings: Vec<PdfWarnMsg> = Vec::new();
-    let pdf_bytes: Vec<u8> = doc.with_pages(vec![page]).save(&save_opts, &mut save_warnings);
+    let pdf_bytes: Vec<u8> = doc.with_pages(pdf_pages).save(&save_opts, &mut save_warnings);
 
-    fs::write("outputs/output_grid.pdf", &pdf_bytes)?;
+    fs::write("outputs/output_multipage.pdf", &pdf_bytes)?;
     if !font_warnings.is_empty() {
         eprintln!("Warnings: font={:?}, save={:?}", font_warnings, save_warnings);
     }
-    println!("Wrote output_grid.pdf");
+    println!("Wrote output_multipage.pdf");
     Ok(())
 }
